@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         HelpDesk Ticket Helper (Plover)
 // @namespace    http://tampermonkey.net/
-// @version      3.36
+// @version      3.37
 // @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс
 // @author       Plover
+// @updateURL    https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
+// @downloadURL  https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
 // @match        https://app.helpdesk.com/tickets*
 // @match        https://app.helpdesk.com/tickets/*
 // @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/668*
