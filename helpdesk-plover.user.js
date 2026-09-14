@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HelpDesk Ticket Helper (Plover)
 // @namespace    http://tampermonkey.net/
-// @version      3.37
+// @version      3.44
 // @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс
 // @author       Plover
 // @updateURL    https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
@@ -391,7 +391,8 @@
     }
 
     function getJq() {
-        const cand = window.AJS && window.AJS.$ ? window.AJS.$ : (window.jQuery || null);
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const cand = (uw.AJS && uw.AJS.$) || uw.jQuery || uw.$ || (window.AJS && window.AJS.$) || window.jQuery;
         return (typeof cand === 'function') ? cand : null;
     }
 
@@ -446,22 +447,30 @@
         const s2 = wrap?.querySelector('.select2-container')
             || document.querySelector('.select2-container[id*="' + (select.id || '') + '"]');
 
-        const clickTarget = s2?.querySelector('.select2-selection, .select2-choice, .select2-selection__rendered, .select2-arrow') || s2;
-        if (clickTarget) clickTarget.click();
-        else select.click();
+        const clickTarget = s2?.querySelector('.select2-choice, .select2-selection--single, .select2-selection, .select2-arrow') || s2;
+        if (clickTarget) {
+            clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+            clickTarget.click();
+        }
 
-        await sleep(350);
+        await sleep(400);
 
-        const search = document.querySelector('.select2-dropdown .select2-search__field, body > .select2-drop .select2-input, .select2-search__field, .select2-input');
+        const search = document.querySelector('.select2-drop-active .select2-input, .select2-container--open .select2-search__field, body > .select2-drop .select2-input, .select2-search__field, .select2-input');
         if (search) {
             search.focus();
             search.value = searchText;
             search.dispatchEvent(new Event('input', { bubbles: true }));
-            search.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }));
-            await sleep(400);
+            const $ = getJq();
+            if ($) {
+                try { $(search).val(searchText).trigger('keyup'); } catch (e) {}
+            }
+            await sleep(450);
+            search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            search.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, which: 13, bubbles: true }));
         }
 
-        const options = [...document.querySelectorAll('.select2-results__option, .select2-result-label, .select2-result, li[role="option"]')];
+        const options = [...document.querySelectorAll('.select2-drop-active .select2-result-label, .select2-container--open .select2-results__option, .select2-results__option, .select2-result-label, .select2-result, li[role="option"]')];
         const target = options.find(opt => {
             const t = opt.textContent.trim().toLowerCase();
             return t === searchText.toLowerCase() || t.includes(searchText.toLowerCase());
@@ -474,28 +483,139 @@
             await sleep(150);
             return true;
         }
-
-        document.body.click();
         return false;
     }
 
-    async function forceCurrency(currencyCode) {
-        const value = CURRENCY_VALUES[currencyCode];
-        if (!value || !currencyCode) return;
+    function findCurrencySelects() {
+        const found = [];
+        const byId = document.querySelector('#customfield_10805, [name="customfield_10805"]');
+        if (byId) found.push(byId);
 
-        const select = document.querySelector('#customfield_10805, [name="customfield_10805"]');
+        [...document.querySelectorAll('label')].forEach(label => {
+            const t = label.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+            if (t !== 'currency' && t !== 'currency*') return;
+            const group = label.closest('.field-group') || label.parentElement;
+            const select = group?.querySelector('select');
+            if (select && !found.includes(select)) found.push(select);
+        });
+
+        const hint = [...document.querySelectorAll('div, span, p')].find(n =>
+            /валюта депозита в псп/i.test(n.textContent)
+        );
+        if (hint) {
+            const group = hint.closest('.field-group') || hint.parentElement;
+            const select = group?.querySelector('select');
+            if (select && !found.includes(select)) found.push(select);
+        }
+        return found;
+    }
+
+    function currencyAlreadySet(select, value, currencyCode) {
+        if (String(select.value) === String(value)) return true;
+        const shown = (select.closest('.field-group') || select.parentElement)
+            ?.querySelector('.select2-selection__rendered, .select2-chosen');
+        const t = (shown?.textContent || '').trim();
+        return t === currencyCode || t.startsWith(currencyCode + ' ');
+    }
+
+    async function flipThenSetCurrency(select, value, currencyCode) {
+        if (currencyAlreadySet(select, value, currencyCode)) return;
+
+        let opt = [...select.options].find(o => String(o.value) === String(value) || o.text.trim() === currencyCode);
+        if (!opt) {
+            opt = document.createElement('option');
+            opt.value = String(value);
+            opt.textContent = currencyCode;
+            select.appendChild(opt);
+        }
+        opt.selected = true;
+        applyNativeSelect(select, value, currencyCode);
+
+        const picked = await pickSelect2Option(select, currencyCode);
+        applyNativeSelect(select, value, currencyCode);
+
+        const shown = (select.closest('.field-group') || select.parentElement)
+            ?.querySelector('.select2-selection__rendered, .select2-chosen');
+        if (shown && !picked) {
+            shown.textContent = currencyCode;
+            shown.title = currencyCode;
+            shown.removeAttribute('placeholder');
+            shown.classList.remove('select2-default');
+        }
+    }
+
+    function visibleSelect2Drop() {
+        return [...document.querySelectorAll('.select2-drop')].find(d => {
+            const st = window.getComputedStyle(d);
+            return st.display !== 'none' && d.querySelector('.select2-result-label, .select2-input');
+        }) || null;
+    }
+
+    async function clickSelect2Label(text) {
+        const drop = visibleSelect2Drop();
+        if (!drop) return false;
+        const label = [...drop.querySelectorAll('.select2-result-label')].find(n =>
+            n.textContent.replace(/\s+/g, ' ').trim() === text
+        );
+        const row = label?.closest('li') || label;
+        if (!row) return false;
+        row.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        row.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        await sleep(180);
+        return true;
+    }
+
+    async function forceCurrency(currencyCode) {
+        if (!currencyCode) return;
+
+        const group = [...document.querySelectorAll('.field-group, .field')].find(g => {
+            const lab = (g.querySelector('label')?.textContent || '').replace(/\s+/g, ' ').trim();
+            return /^currency\*?$/i.test(lab);
+        });
+        const select = document.querySelector('#customfield_10805, [name="customfield_10805"]')
+            || group?.querySelector('select');
         if (!select) return;
 
-        applyNativeSelect(select, value, currencyCode);
-        await pickSelect2Option(select, currencyCode);
-        applyNativeSelect(select, value, currencyCode);
-
-        const container = select.closest('.field-group')?.querySelector('.select2-container');
-        const rendered = container?.querySelector('.select2-selection__rendered, .select2-chosen');
-        if (rendered) {
-            rendered.textContent = currencyCode;
-            rendered.title = currencyCode;
+        let opt = [...select.options].find(o => o.text.trim() === currencyCode);
+        if (!opt && CURRENCY_VALUES[currencyCode]) {
+            opt = document.createElement('option');
+            opt.value = String(CURRENCY_VALUES[currencyCode]);
+            opt.textContent = currencyCode;
+            select.appendChild(opt);
         }
+        if (!opt) return;
+        const value = opt.value;
+
+        const $ = getJq();
+        const commit = (val) => {
+            [...select.options].forEach(o => { o.selected = String(o.value) === String(val); });
+            select.value = String(val);
+            select.dispatchEvent(new Event('input', { bubbles: true }));
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!$) return;
+            try {
+                $(select).val(String(val)).trigger('change');
+                try { $(select).select2('val', String(val)); } catch (e) {}
+                try { $(select).select2('data', { id: String(val), text: currencyCode }); } catch (e) {}
+                $(select).trigger('change');
+            } catch (e) {}
+        };
+
+        commit(value);
+
+        if (String(select.value) !== String(value)) {
+            const s2 = document.querySelector('#s2id_' + (select.id || 'customfield_10805'))
+                || group?.querySelector('.select2-container');
+            const choice = s2?.querySelector('.select2-choice');
+            if (choice) {
+                choice.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                await sleep(300);
+                await clickSelect2Label(currencyCode);
+                commit(value);
+            }
+        }
+
+        console.log('[Plover] Currency value=', select.value, 'text=', select.selectedOptions[0]?.text);
     }
 
     async function doForceFillMinmax(data) {
@@ -533,8 +653,6 @@
 
         if (data.currency) {
             await forceCurrency(data.currency);
-            setTimeout(() => forceCurrency(data.currency), 900);
-            setTimeout(() => forceCurrency(data.currency), 2000);
         }
     }
 
@@ -686,9 +804,9 @@
         if (data.currency) {
             if (CURRENCY_VALUES[data.currency]) {
                 setSelectById('customfield_12801', CURRENCY_VALUES[data.currency], data.currency);
-                setSelectById('customfield_10805', CURRENCY_VALUES[data.currency], data.currency);
             }
             setSelectByOptionText('Account Currency', data.currency);
+            setSelectById('customfield_10805', CURRENCY_VALUES[data.currency], data.currency);
             setSelectByOptionText('Currency', data.currency);
             forceCurrency(data.currency);
         }
