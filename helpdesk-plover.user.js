@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HelpDesk Ticket Helper (Plover)
 // @namespace    http://tampermonkey.net/
-// @version      3.44
-// @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс
+// @version      3.56
+// @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс/Отмена
 // @author       Plover
 // @updateURL    https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
 // @downloadURL  https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
@@ -11,6 +11,8 @@
 // @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/668*
 // @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/682*
 // @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/683*
+// @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/894*
+// @match        https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/1170*
 // @match        https://cc.boadmin.org/*
 // @match        https://gm.boadmin.org/*
 // @match        https://dy.boadmin.org/*
@@ -48,6 +50,10 @@
     const FORM_MINMAX = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/668';
     const FORM_AVANCE = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/682';
     const FORM_LOYALTY = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/683';
+    const FORM_PARTIAL = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/894';
+    const FORM_FULL = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/1170';
+    const FULL_STATUSES = ['Pending', 'Success'];
+    const CANCEL_KEY = 'plover_cancel_data_v1';
     const STORAGE_KEY = 'plover_helpdesk_panel_collapsed';
     const DATA_KEY = 'plover_form_data_v6';
     const AVANCE_KEY = 'plover_avance_data_v1';
@@ -136,6 +142,75 @@
         return useful.some(l => /\b(VIP|HighRoll|High[\s-]?Roll)\b/i.test(l));
     }
 
+    function cleanPayoutName(raw) {
+        if (!raw) return '';
+        return String(raw)
+            .replace(/_?(HTTT)_?/gi, '_')
+            .replace(/__+/g, '_')
+            .replace(/^[_-\s]+|[_-\s]+$/g, '')
+            .trim();
+    }
+
+    function extractPspBlock(text) {
+        const raw = String(text).replace(/\u00a0/g, ' ');
+        let method = null;
+        let pspToken = null;
+        let hasMethod = /Method[:\s]+[A-Z0-9]/i.test(raw);
+        const re = /Method[:\s]+([A-Z0-9][A-Z0-9_+-]*)/gi;
+        let m;
+        while ((m = re.exec(raw))) {
+            if (!method) method = m[1];
+            const slice = raw.slice(m.index, m.index + 400);
+            const idm = slice.match(/Method[:\s]+[A-Z0-9_+-]+[\s\r\n]+ID[:\s]+(\d{5,})/i)
+                || slice.match(/Method[:\s]+[A-Z0-9_+-]+\s+ID[:\s]+(\d{5,})/i);
+            if (idm) {
+                method = m[1];
+                pspToken = idm[1];
+                break;
+            }
+        }
+        if (!method) method = extractByRegex(/Method[:\s]*([A-Z0-9][A-Z0-9_+-]*)/i, raw);
+        if (method && /^(HTTT)$/i.test(String(method).trim())) method = null;
+        if (!method) {
+            const fromPs = raw.match(/PS[:\s]+([^\n]*pay[-_ ]?out[^\n]*)/i);
+            const fromLine = raw.match(/(?:^|\n)\s*([A-Za-z0-9][A-Za-z0-9 _+-]*pay[-_ ]?out[A-Za-z0-9 _+-]*)\s*(?:\n|$)/i);
+            const fromToken = raw.match(/\b([A-Z0-9][A-Z0-9_+-]*PAY[-_]?OUT[A-Z0-9_+-]*)\b/i);
+            method = (fromPs && fromPs[1]) || (fromLine && fromLine[1]) || (fromToken && fromToken[1]) || null;
+            if (method) method = method.replace(/\s+/g, ' ').trim();
+            if (method && /^(HTTT)$/i.test(method)) method = null;
+        }
+        return { method, pspToken, hasMethod };
+    }
+
+    function extractCancelToken(text, pspToken) {
+        const merchant = extractByRegex(/Merchant\s*Transaction\s*ID[:\s]*([A-Za-z0-9_-]+)/i, text);
+        if (merchant) return merchant;
+
+        const ids = [...String(text).matchAll(/(?:^|\n)\s*ID[:\s]*([A-Za-z0-9_-]+)/gi)].map(m => m[1]);
+        const other = ids.find(id => id && id !== pspToken);
+        if (other) return other;
+
+        return extractByRegex(/(\d{8,14})\s*(?:\n|Method|Bank)/i, text);
+    }
+
+    function extractWithdrawDate(text) {
+        const raw = extractByRegex(/Date[:\s]*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i, text)
+            || extractByRegex(/Дата(?:\s*вывода)?[:\s]*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/i, text);
+        if (!raw) return null;
+        const d = raw.match(/(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/);
+        return d ? d[1] : raw;
+    }
+
+    function extractRequestedAmount(text) {
+        const raw = String(text).replace(/\u00a0/g, ' ');
+        const fromSum = raw.match(/Сумма[:\s]+([0-9][0-9\s,]*(?:[.,][0-9]+)?)/i);
+        const names = CURRENCIES.join('|');
+        const fromCur = raw.match(new RegExp('([0-9][0-9\\s,]*(?:[.,][0-9]+)?)\\s*(' + names + ')\\b', 'i'));
+        const val = (fromSum && fromSum[1]) || (fromCur && fromCur[1]);
+        if (!val) return null;
+        return val.replace(/\s+/g, ' ').trim().replace(/[.,]00$/, '');
+    }
+
     function collectTicketData() {
         const text = getText();
 
@@ -143,9 +218,12 @@
         if (!ticketId) ticketId = location.pathname.match(/\/tickets\/([A-Za-z0-9-]+)/)?.[1];
 
         const pair = extractPlayerAndProject(text);
-        let playerId = pair.playerId;
+        let playerId = extractByRegex(/ID клиента[:\s]*(\d{7,12})/i, text) || pair.playerId;
         if (!playerId) playerId = extractByRegex(/(\d{7,12})\s*(?:\n+\s*)?(?:HighRoll|VIP)\s*(?:Cat|Gama|Daddy|Mers|R7|Kent|Kometa|Arkada)/i, text);
         if (!playerId) playerId = extractByRegex(/(?:^|\n)\s*(\d{7,12})\s*\n/i, text);
+
+        const pspBlock = extractPspBlock(text);
+        const token = extractCancelToken(text, pspBlock.pspToken);
 
         return {
             ticketId,
@@ -153,9 +231,13 @@
             isVip: detectVip(text),
             minMaxLine: extractByRegex(/([^\n]*min-max:\s*[\d\s\-,]+[^\n]*)/i, text)
                 || extractByRegex(/([^\n]*\(min-max:[^\n]*)/i, text),
-            token: extractByRegex(/Merchant\s*Transaction\s*ID[:\s]*(\d+)/i, text)
-                || extractByRegex(/(?:^|\n)\s*(\d{8,14})\s*(?:\n|Method|Bank)/i, text),
-            psp: extractByRegex(/Method[:\s]*([A-Z0-9_]+)/i, text),
+            token,
+            psp: cleanPayoutName(pspBlock.method || extractByRegex(/Method[:\s]*([A-Z0-9_+-]+)/i, text)),
+            methodId: pspBlock.pspToken || null,
+            pspToken: pspBlock.pspToken || token,
+            hasMethod: !!pspBlock.hasMethod,
+            withdrawDate: extractWithdrawDate(text),
+            requestedAmount: extractRequestedAmount(text),
             project: pair.project || findProject(text),
             ticketLink: ticketId ? 'https://app.helpdesk.com/tickets/' + ticketId : location.href
         };
@@ -175,7 +257,7 @@
                     z-index: 999999; background: linear-gradient(135deg, #1e293b, #0f172a);
                     border: 1px solid #334155; border-radius: 12px;
                     box-shadow: 0 10px 25px rgba(0,0,0,0.45);
-                    font-family: system-ui, sans-serif; color: #e2e8f0; min-width: 360px;
+                    font-family: system-ui, sans-serif; color: #e2e8f0; min-width: 420px;
                 }
                 #plover-panel.collapsed .plover-body { display: none; }
                 #plover-header {
@@ -198,6 +280,8 @@
                 .plover-btn.kb { background: #1e40af; }
                 .plover-btn.avance { background: #6b21a8; }
                 .plover-btn.loyalty { background: #be185d; }
+                .plover-btn.partial { background: #0f766e; }
+                .plover-btn.fullcancel { background: #7f1d1d; }
             </style>
             <div id="plover-header">
                 <div id="plover-title">Created By Plover</div>
@@ -209,6 +293,8 @@
                 <button class="plover-btn kb" data-action="kb">КБ</button>
                 <button class="plover-btn avance" data-action="avance">Аванс</button>
                 <button class="plover-btn loyalty" data-action="loyalty">Лояльность</button>
+                <button class="plover-btn partial" data-action="partial">Частич. Отмена</button>
+                <button class="plover-btn fullcancel" data-action="fullcancel">Полная Отмена</button>
             </div>
         `;
         if (collapsed) panel.classList.add('collapsed');
@@ -270,9 +356,15 @@
         document.getElementById('plover-modal')?.remove();
         const isAvance = action === 'avance';
         const isLoyalty = action === 'loyalty';
+        const isPartial = action === 'partial';
+        const isFullCancel = action === 'fullcancel';
         const extraForm = isAvance || isLoyalty;
         const reasons = isLoyalty ? LOYALTY_REASONS : AVANCE_REASONS;
-        const title = isLoyalty ? 'Лояльность' : isAvance ? 'Аванс' : action.toUpperCase();
+        const title = isLoyalty ? 'Лояльность'
+            : isAvance ? 'Аванс'
+            : isPartial ? 'Частич. Отмена'
+            : isFullCancel ? 'Полная Отмена'
+            : action.toUpperCase();
         const modal = document.createElement('div');
         modal.id = 'plover-modal';
         modal.innerHTML = `
@@ -294,10 +386,11 @@
             </style>
             <div class="plover-modal-content">
                 <h3 style="margin:0 0 18px;text-align:center;">${title}</h3>
+                ${isFullCancel ? '' : `
                 <div class="plover-field">
-                    <label>Сумма</label>
+                    <label>${isPartial ? 'Сумма, которую вывела платежка' : 'Сумма'}</label>
                     <input type="number" id="plover-amount" placeholder="Введите сумму" step="any" autofocus>
-                </div>
+                </div>`}
                 <div class="plover-field">
                     <label>Валюта</label>
                     <select id="plover-currency">
@@ -318,6 +411,22 @@
                         ${LOYALTY_STATUSES.map(s => '<option value="' + s + '">' + s + '</option>').join('')}
                     </select>
                 </div>` : ''}
+                ${isPartial ? `
+                <div class="plover-field">
+                    <label>Дата частичной отмены</label>
+                    <input type="date" id="plover-cancel-date">
+                </div>` : ''}
+                ${isFullCancel ? `
+                <div class="plover-field">
+                    <label>Дата отмены</label>
+                    <input type="date" id="plover-cancel-date">
+                </div>
+                <div class="plover-field">
+                    <label>Withdrawal status to return</label>
+                    <select id="plover-wd-status">
+                        ${FULL_STATUSES.map(s => '<option value="' + s + '">' + s + '</option>').join('')}
+                    </select>
+                </div>` : ''}
                 <div class="plover-actions">
                     <button class="plover-cancel">Отмена</button>
                     <button class="plover-ok">${extraForm ? 'Открыть профиль и форму' : 'Открыть форму'}</button>
@@ -328,13 +437,19 @@
 
         modal.querySelector('.plover-cancel').onclick = () => modal.remove();
         modal.querySelector('.plover-ok').onclick = () => {
-            const amount = parseFloat(modal.querySelector('#plover-amount').value);
+            const amount = parseFloat(modal.querySelector('#plover-amount')?.value);
             const currency = modal.querySelector('#plover-currency').value;
             const reason = modal.querySelector('#plover-reason')?.value || '';
             const tokenStatus = modal.querySelector('#plover-token-status')?.value || '';
-            if (!amount || amount <= 0) return alert('Введите корректную сумму');
+            const cancelDate = modal.querySelector('#plover-cancel-date')?.value || '';
+            const wdStatus = modal.querySelector('#plover-wd-status')?.value || '';
+            if (!isFullCancel && (!amount || amount <= 0)) return alert('Введите корректную сумму');
+            if (isPartial && !cancelDate) return alert('Укажите дату частичной отмены');
+            if (isFullCancel && !cancelDate) return alert('Укажите дату отмены');
             modal.remove();
             if (action === 'avance' || action === 'loyalty') openAvanceFlow(action, amount, currency, reason, tokenStatus);
+            else if (action === 'partial') openPartialCancel(amount, currency, cancelDate);
+            else if (action === 'fullcancel') openFullCancel(currency, cancelDate, wdStatus);
             else openMinmaxForm(action, amount, currency);
         };
     }
@@ -357,6 +472,226 @@
         if (data.psp) params.set('customfield_12605', data.psp);
 
         GM_openInTab(FORM_MINMAX + (params.toString() ? '?' + params.toString() : ''), { active: true });
+    }
+
+    function formatDateRu(iso) {
+        if (!iso) return '';
+        const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return m[3] + '.' + m[2] + '.' + m[1];
+        return iso;
+    }
+
+    function buildPartialSummary(data) {
+        const payout = cleanPayoutName(data.psp);
+        const left = [data.playerId, data.project].filter(Boolean).join(' ');
+        return [left, payout].filter(Boolean).join(' / ');
+    }
+
+    function buildPartialDescription(data) {
+        return [
+            'Дата частичной отмены: ' + (formatDateRu(data.cancelDate) || data.cancelDate || 'не указана'),
+            'Дата вывода: ' + (data.withdrawDate || 'не найдено')
+        ].join('\n');
+    }
+
+    function openPartialCancel(amount, currency, cancelDate) {
+        const data = collectTicketData();
+        const payload = {
+            action: 'partial',
+            amount,
+            currency,
+            cancelDate,
+            ...data,
+            timestamp: Date.now()
+        };
+        GM_setValue(CANCEL_KEY, JSON.stringify(payload));
+
+        const params = new URLSearchParams();
+        const summary = buildPartialSummary(payload);
+        if (summary) params.set('summary', summary);
+        params.set('description', buildPartialDescription(payload));
+        if (payload.playerId) params.set('customfield_12600', payload.playerId);
+        if (payload.ticketLink) params.set('customfield_12606', payload.ticketLink);
+        if (payload.psp) params.set('customfield_12605', payload.psp);
+        if (payload.token) params.set('customfield_12603', payload.token);
+
+        GM_openInTab(FORM_PARTIAL + '?' + params.toString(), { active: true });
+    }
+
+    function fillPartialForm(data) {
+        const summary = buildPartialSummary(data);
+        const description = buildPartialDescription(data);
+
+        setInputByName('summary', summary);
+        setInputByLabel('Summary', summary);
+
+        const desc = document.querySelector('#description, [name="description"], textarea#description, textarea[name="description"]');
+        if (desc) {
+            desc.value = description;
+            desc.dispatchEvent(new Event('input', { bubbles: true }));
+            desc.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        const iframe = document.querySelector('iframe.tox-edit-area__iframe, .wiki-edit-content iframe, iframe[id*="description"]');
+        if (iframe && iframe.contentDocument && iframe.contentDocument.body) {
+            iframe.contentDocument.body.innerText = description;
+        }
+
+        if (data.project) {
+            if (PROJECT_VALUES[data.project]) setSelectByLabel('Project', PROJECT_VALUES[data.project]);
+            setSelectByOptionText('Project', data.project);
+        }
+
+        setInputByLabel('Player ID', data.playerId);
+        if (data.playerId) setInputByName('customfield_12600', data.playerId);
+
+        setSelectByLabel('Player VIP', data.isVip ? '13928' : '13929');
+        setSelectByOptionText('Player VIP', data.isVip ? 'Yes' : 'No');
+
+        if (data.requestedAmount) {
+            setInputByLabel('Requested withdrawal amount', data.requestedAmount);
+        }
+        setInputByLabel('Actual withdrawal amount', data.amount);
+
+        if (data.currency) {
+            setSelectByOptionText('Currency', data.currency);
+            if (CURRENCY_VALUES[data.currency]) {
+                setSelectById('customfield_10805', CURRENCY_VALUES[data.currency], data.currency);
+                setSelectById('customfield_12801', CURRENCY_VALUES[data.currency], data.currency);
+            }
+            forceCurrency(data.currency);
+        }
+
+        if (data.token) {
+            setInputByLabel('Token', data.token);
+            setInputByName('customfield_12603', data.token);
+        }
+        if (data.pspToken) {
+            setInputByLabel('PSP Token', data.pspToken);
+            const lab = [...document.querySelectorAll('label')].find(l => {
+                const t = l.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+                return t.includes('psp') && t.includes('token');
+            });
+            const box = lab ? (lab.closest('.field-group') || lab.parentElement) : null;
+            const el = box?.querySelector('input:not([type="hidden"]), textarea');
+            if (el) {
+                el.value = String(data.pspToken);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+        if (data.psp) {
+            setInputByLabel('PSP', data.psp);
+            setInputByName('customfield_12605', data.psp);
+        }
+        if (data.ticketLink) {
+            setInputByLabel('Ticket Link', data.ticketLink);
+            setInputByName('customfield_12606', data.ticketLink);
+        }
+        console.log('[Plover] Частич. отмена', data);
+    }
+
+    function startPartialFill() {
+        const raw = GM_getValue(CANCEL_KEY);
+        if (!raw) return;
+        let data;
+        try { data = JSON.parse(raw); } catch { return; }
+        if (Date.now() - data.timestamp > 15 * 60 * 1000) return;
+
+        addForceBtn('🔄 Заполнить частичную отмену', () => fillPartialForm(data));
+        setTimeout(() => fillPartialForm(data), 1500);
+        setTimeout(() => fillPartialForm(data), 3000);
+    }
+
+    function buildFullDescription(data) {
+        return [
+            'Дата создания: ' + (data.withdrawDate || 'не найдено'),
+            'Дата отмены: ' + (formatDateRu(data.cancelDate) || data.cancelDate || 'не указана'),
+            'Метод: ' + (cleanPayoutName(data.psp) || data.psp || 'не найдено'),
+            data.hasMethod
+                ? ('Токен ПС - ' + (data.methodId || 'не найдено'))
+                : ('Токен с фундиста: ' + (data.token || 'не найдено'))
+        ].join('\n');
+    }
+
+    function writeDescription(text) {
+        const desc = document.querySelector('#description, [name="description"], textarea#description, textarea[name="description"]');
+        if (desc) {
+            desc.value = text;
+            desc.dispatchEvent(new Event('input', { bubbles: true }));
+            desc.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        const iframe = document.querySelector('iframe.tox-edit-area__iframe, .wiki-edit-content iframe, iframe[id*="description"]');
+        if (iframe && iframe.contentDocument && iframe.contentDocument.body) {
+            iframe.contentDocument.body.innerText = text;
+        }
+    }
+
+    function openFullCancel(currency, cancelDate, wdStatus) {
+        const data = collectTicketData();
+        const payload = {
+            action: 'fullcancel',
+            currency,
+            cancelDate,
+            wdStatus,
+            ...data,
+            timestamp: Date.now()
+        };
+        GM_setValue(CANCEL_KEY, JSON.stringify(payload));
+
+        const params = new URLSearchParams();
+        const summary = buildPartialSummary(payload);
+        if (summary) params.set('summary', summary);
+        params.set('description', buildFullDescription(payload));
+        if (payload.playerId) params.set('customfield_12600', payload.playerId);
+        GM_openInTab(FORM_FULL + '?' + params.toString(), { active: true });
+    }
+
+    function fillFullForm(data) {
+        const summary = buildPartialSummary(data);
+        const description = buildFullDescription(data);
+
+        setInputByName('summary', summary);
+        setInputByLabel('Summary', summary);
+        writeDescription(description);
+
+        if (data.project) {
+            if (PROJECT_VALUES[data.project]) setSelectByLabel('Project', PROJECT_VALUES[data.project]);
+            setSelectByOptionText('Project', data.project);
+        }
+
+        setInputByLabel('Player ID', data.playerId);
+        if (data.playerId) setInputByName('customfield_12600', data.playerId);
+
+        const paymentId = data.token;
+        if (paymentId) {
+            setInputByLabel('Payment ID', paymentId);
+            setInputByLabel('Payment Id', paymentId);
+        }
+
+        if (data.wdStatus) {
+            setSelectByOptionText('Withdrawal status to return', data.wdStatus);
+            if (/success/i.test(data.wdStatus)) {
+                setSelectByOptionText('Withdrawal status to return', 'Success');
+                setSelectByOptionText('Withdrawal status to return', 'Succes');
+            } else {
+                setSelectByOptionText('Withdrawal status to return', 'Pending');
+            }
+        }
+
+        console.log('[Plover] Полная отмена', data);
+    }
+
+    function startFullFill() {
+        const raw = GM_getValue(CANCEL_KEY);
+        if (!raw) return;
+        let data;
+        try { data = JSON.parse(raw); } catch { return; }
+        if (data.action && data.action !== 'fullcancel') return;
+        if (Date.now() - data.timestamp > 15 * 60 * 1000) return;
+
+        addForceBtn('🔄 Заполнить полную отмену', () => fillFullForm(data));
+        setTimeout(() => fillFullForm(data), 1500);
+        setTimeout(() => fillFullForm(data), 3000);
     }
 
     function openAvanceFlow(action, amount, currency, reason, tokenStatus) {
@@ -690,7 +1025,8 @@
     function setInputByLabel(labelText, value) {
         if (value == null || value === '') return false;
         const labels = [...document.querySelectorAll('label')];
-        const label = labels.find(l => l.textContent.trim().toLowerCase().includes(labelText.toLowerCase()));
+        const want = labelText.trim().toLowerCase();
+        const label = labels.find(l => l.textContent.trim().toLowerCase().replace(/\*$/, '') === want);
         const group = label ? (label.closest('.field-group') || label.parentElement) : null;
         const input = group?.querySelector('input:not([type="hidden"]), textarea')
             || document.querySelector('[name="' + labelText + '"]');
@@ -1557,6 +1893,10 @@
         startMinmaxFill();
     } else if (location.href.includes('/create/682') || location.href.includes('/create/683')) {
         startAvanceFormFill();
+    } else if (location.href.includes('/create/894')) {
+        startPartialFill();
+    } else if (location.href.includes('/create/1170')) {
+        startFullFill();
     } else if (/\.boadmin\.org$/i.test(location.hostname) && /\/Users\/Summary\//i.test(location.pathname)) {
         scrapeAvanceProfile();
     }
