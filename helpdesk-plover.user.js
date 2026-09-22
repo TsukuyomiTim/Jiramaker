@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HelpDesk Ticket Helper (Plover)
 // @namespace    http://tampermonkey.net/
-// @version      3.56
+// @version      3.57
 // @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс/Отмена
 // @author       Plover
 // @updateURL    https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
@@ -54,6 +54,7 @@
     const FORM_FULL = 'https://tasks.deltasystem.tech/servicedesk/customer/portal/22/create/1170';
     const FULL_STATUSES = ['Pending', 'Success'];
     const CANCEL_KEY = 'plover_cancel_data_v1';
+    const FORM_SOURCE_KEY = 'plover_form_source_v1';
     const STORAGE_KEY = 'plover_helpdesk_panel_collapsed';
     const DATA_KEY = 'plover_form_data_v6';
     const AVANCE_KEY = 'plover_avance_data_v1';
@@ -504,6 +505,7 @@
             ...data,
             timestamp: Date.now()
         };
+        GM_setValue(FORM_SOURCE_KEY, 'helpdesk');
         GM_setValue(CANCEL_KEY, JSON.stringify(payload));
 
         const params = new URLSearchParams();
@@ -591,6 +593,7 @@
     }
 
     function startPartialFill() {
+        if (GM_getValue(FORM_SOURCE_KEY) === 'sheet') return;
         const raw = GM_getValue(CANCEL_KEY);
         if (!raw) return;
         let data;
@@ -636,6 +639,7 @@
             ...data,
             timestamp: Date.now()
         };
+        GM_setValue(FORM_SOURCE_KEY, 'helpdesk');
         GM_setValue(CANCEL_KEY, JSON.stringify(payload));
 
         const params = new URLSearchParams();
@@ -682,6 +686,7 @@
     }
 
     function startFullFill() {
+        if (GM_getValue(FORM_SOURCE_KEY) === 'sheet') return;
         const raw = GM_getValue(CANCEL_KEY);
         if (!raw) return;
         let data;
@@ -1819,6 +1824,8 @@
     }
 
     async function scrapeAvanceProfile() {
+        if (new URLSearchParams(location.search).get('plover') === '1') return;
+        if (GM_getValue(FORM_SOURCE_KEY) === 'sheet') return;
         const raw = GM_getValue(AVANCE_KEY);
         if (!raw) return;
         let data;
