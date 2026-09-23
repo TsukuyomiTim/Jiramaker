@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HelpDesk Ticket Helper (Plover)
 // @namespace    http://tampermonkey.net/
-// @version      3.57
+// @version      3.58
 // @description  Быстрые действия + заполнение форм МинМакс/КБ/Аванс/Отмена
 // @author       Plover
 // @updateURL    https://github.com/TsukuyomiTim/Jiramaker/raw/refs/heads/main/helpdesk-plover.user.js
@@ -516,6 +516,7 @@
         if (payload.ticketLink) params.set('customfield_12606', payload.ticketLink);
         if (payload.psp) params.set('customfield_12605', payload.psp);
         if (payload.token) params.set('customfield_12603', payload.token);
+        params.set('source', 'helpdesk');
 
         GM_openInTab(FORM_PARTIAL + '?' + params.toString(), { active: true });
     }
@@ -592,8 +593,14 @@
         console.log('[Plover] Частич. отмена', data);
     }
 
+    function formSource() {
+        return new URLSearchParams(location.search).get('source')
+            || (location.hash.match(/source=([a-z]+)/i) || [])[1]
+            || '';
+    }
+
     function startPartialFill() {
-        if (GM_getValue(FORM_SOURCE_KEY) === 'sheet') return;
+        if (formSource() !== 'helpdesk') return;
         const raw = GM_getValue(CANCEL_KEY);
         if (!raw) return;
         let data;
@@ -647,6 +654,7 @@
         if (summary) params.set('summary', summary);
         params.set('description', buildFullDescription(payload));
         if (payload.playerId) params.set('customfield_12600', payload.playerId);
+        params.set('source', 'helpdesk');
         GM_openInTab(FORM_FULL + '?' + params.toString(), { active: true });
     }
 
@@ -686,7 +694,7 @@
     }
 
     function startFullFill() {
-        if (GM_getValue(FORM_SOURCE_KEY) === 'sheet') return;
+        if (formSource() !== 'helpdesk') return;
         const raw = GM_getValue(CANCEL_KEY);
         if (!raw) return;
         let data;
